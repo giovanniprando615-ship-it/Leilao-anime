@@ -10,12 +10,16 @@ function createRoom(series: StoredRoom['series'] = 'ONE_PIECE'): StoredRoom {
     series,
     phase: 'LOBBY',
     hostPlayerId: 'host',
+    forfeitWinnerPlayerId: null,
+    forfeitMessage: null,
+    forfeitAt: null,
     players: [
-      { playerId: 'host', name: 'Host', connected: true, balanceCents: 6000, team: [] },
-      { playerId: 'guest', name: 'Guest', connected: true, balanceCents: 6000, team: [] }
+      { playerId: 'host', name: 'Host', connected: true, ready: false, balanceCents: 6000, team: [] },
+      { playerId: 'guest', name: 'Guest', connected: true, ready: false, balanceCents: 6000, team: [] }
     ],
     auction: null,
     battleResult: null,
+    battleSeed: null,
     lastActivityAt: 0
   };
 }

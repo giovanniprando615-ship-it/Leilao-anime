@@ -1,13 +1,22 @@
 import { GAME_RULES, ROSTER } from '@leilao/shared';
-import type { BattleScenario, CharacterTag } from '@leilao/shared';
-import type { BattleModifier, BattleResult, BattleScoreBreakdown } from '@leilao/shared';
+import type {
+  BattleModifier,
+  BattleResult,
+  BattleScenario,
+  BattleScenarioAnalysis,
+  BattleScoreBreakdown,
+  CharacterTag
+} from '@leilao/shared';
 import type { StoredRoom } from './room-store.js';
 
 export class BattleRuleError extends Error {}
 
 const charactersById = new Map(ROSTER.map((character) => [character.id, character]));
+const BATTLE_SCENARIOS = ['STANDARD', 'DEATHMATCH'] as const satisfies readonly BattleScenario[];
+const MAX_SEED = 0xffff_ffff;
 
 type BattleCharacter = (typeof ROSTER)[number];
+type TeamScore = Omit<BattleScoreBreakdown, 'winProbability'>;
 
 function countTag(characters: readonly BattleCharacter[], tag: CharacterTag): number {
   return characters.filter((character) => character.tags.includes(tag)).length;
@@ -18,15 +27,17 @@ function sumModifiers(modifiers: readonly BattleModifier[]): number {
 }
 
 function calculateBaseScore(characters: readonly BattleCharacter[], scenario: BattleScenario): number {
+  if (characters.length === 0) {
+    return 0;
+  }
   const weights = GAME_RULES.scenarios[scenario].weights;
-  const weightedTotal = characters.reduce(
+  return characters.reduce(
     (total, character) => total
       + character.power * weights.power
       + character.speed * weights.speed
       + character.resistance * weights.resistance,
     0
-  );
-  return weightedTotal / characters.length;
+  ) / characters.length;
 }
 
 function calculateSynergy(characters: readonly BattleCharacter[]): BattleModifier[] {
@@ -37,7 +48,8 @@ function calculateSynergy(characters: readonly BattleCharacter[]): BattleModifie
     if (rule.characterIds.every((characterId) => characterIds.has(characterId))) {
       modifiers.push({
         id: `pair:${rule.characterIds.join('+')}`,
-        points: rule.bonus
+        points: rule.bonus,
+        probabilityChange: 0
       });
     }
   }
@@ -52,7 +64,8 @@ function calculateSynergy(characters: readonly BattleCharacter[]): BattleModifie
     if (count >= GAME_RULES.synergies.groups.minimumMembers) {
       modifiers.push({
         id: `group:${group}`,
-        points: count * GAME_RULES.synergies.groups.bonusPerMember
+        points: count * GAME_RULES.synergies.groups.bonusPerMember,
+        probabilityChange: 0
       });
     }
   }
@@ -74,7 +87,7 @@ function calculateCounters(
       countTag(opponents, rule.enemyTag)
     );
     return matches > 0
-      ? [{ id: rule.id, points: matches * rule.bonusPerMatch }]
+      ? [{ id: rule.id, points: matches * rule.bonusPerMatch, probabilityChange: 0 }]
       : [];
   });
 }
@@ -86,7 +99,7 @@ function calculateScenarioModifiers(
   const scenarioRules = GAME_RULES.scenarios[scenario];
   const modifiers: BattleModifier[] = [];
   if (scenarioRules.baseModifier !== 0) {
-    modifiers.push({ id: 'scenario-base', points: scenarioRules.baseModifier });
+    modifiers.push({ id: 'scenario-base', points: scenarioRules.baseModifier, probabilityChange: 0 });
   }
 
   for (const rule of GAME_RULES.counters.scenarioMatches) {
@@ -95,19 +108,23 @@ function calculateScenarioModifiers(
     }
     const count = countTag(characters, rule.friendlyTag);
     if (count > 0) {
-      modifiers.push({ id: rule.id, points: count * rule.bonusPerCharacter });
+      modifiers.push({
+        id: rule.id,
+        points: count * rule.bonusPerCharacter,
+        probabilityChange: 0
+      });
     }
   }
 
   if ('exhaustionPenaltyPerCharacter' in scenarioRules) {
-    const immunityTag = scenarioRules.exhaustionImmunityTag;
     const exhaustedCount = characters.filter(
-      (character) => !character.tags.includes(immunityTag)
+      (character) => !character.tags.includes(scenarioRules.exhaustionImmunityTag)
     ).length;
     if (exhaustedCount > 0) {
       modifiers.push({
         id: scenarioRules.exhaustionModifierId,
-        points: -exhaustedCount * scenarioRules.exhaustionPenaltyPerCharacter
+        points: -exhaustedCount * scenarioRules.exhaustionPenaltyPerCharacter,
+        probabilityChange: 0
       });
     }
   }
@@ -120,7 +137,7 @@ function calculateTeamScore(
   ownCharacters: readonly BattleCharacter[],
   enemyCharacters: readonly BattleCharacter[],
   scenario: BattleScenario
-): Omit<BattleScoreBreakdown, 'winProbability'> {
+): TeamScore {
   const synergyBreakdown = calculateSynergy(ownCharacters);
   const counterBreakdown = calculateCounters(ownCharacters, enemyCharacters);
   const scenarioBreakdown = calculateScenarioModifiers(ownCharacters, scenario);
@@ -156,15 +173,75 @@ function probabilityFromDifference(difference: number, scale: number): number {
   return 1 / (1 + Math.exp(-exponent));
 }
 
-export class BattleEngine {
-  constructor(private readonly random: () => number = Math.random) {}
+function withProbabilityImpacts(
+  modifiers: readonly BattleModifier[],
+  ownTotal: number,
+  opponentTotal: number,
+  scale: number
+): BattleModifier[] {
+  const ownWinProbability = probabilityFromDifference(ownTotal - opponentTotal, scale);
+  return modifiers.map((modifier) => ({
+    ...modifier,
+    probabilityChange: ownWinProbability
+      - probabilityFromDifference(ownTotal - modifier.points - opponentTotal, scale)
+  }));
+}
 
+function withTeamProbability(
+  score: TeamScore,
+  opponent: TeamScore,
+  winProbability: number,
+  scale: number
+): BattleScoreBreakdown {
+  return {
+    ...score,
+    winProbability,
+    synergyBreakdown: withProbabilityImpacts(score.synergyBreakdown, score.total, opponent.total, scale),
+    counterBreakdown: withProbabilityImpacts(score.counterBreakdown, score.total, opponent.total, scale),
+    scenarioBreakdown: withProbabilityImpacts(score.scenarioBreakdown, score.total, opponent.total, scale)
+  };
+}
+
+function analyzeScenario(
+  playerIds: readonly [string, string],
+  teams: readonly [readonly BattleCharacter[], readonly BattleCharacter[]],
+  scenario: BattleScenario
+): BattleScenarioAnalysis {
+  const teamA = calculateTeamScore(playerIds[0], teams[0], teams[1], scenario);
+  const teamB = calculateTeamScore(playerIds[1], teams[1], teams[0], scenario);
+  const probabilityA = probabilityFromDifference(
+    teamA.total - teamB.total,
+    GAME_RULES.scenarios[scenario].probabilityScale
+  );
+  return {
+    scenario,
+    scores: [
+      withTeamProbability(teamA, teamB, probabilityA, GAME_RULES.scenarios[scenario].probabilityScale),
+      withTeamProbability(teamB, teamA, 1 - probabilityA, GAME_RULES.scenarios[scenario].probabilityScale)
+    ],
+    drawProbability: 0
+  };
+}
+
+function createSeededRandom(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 0x1_0000_0000;
+  };
+}
+
+export class BattleEngine {
   simulate(
     room: StoredRoom,
     scenario: BattleScenario,
+    seed: number,
     now = Date.now()
   ): BattleResult {
-    if (scenario !== 'STANDARD' && scenario !== 'DEATHMATCH') {
+    if (!BATTLE_SCENARIOS.includes(scenario)) {
       throw new BattleRuleError('Cenário de batalha inválido.');
     }
     if (room.phase !== 'TEAM_REVIEW' && room.phase !== 'RESULT') {
@@ -173,63 +250,50 @@ export class BattleEngine {
     if (room.players.length !== 2) {
       throw new BattleRuleError('A sala precisa ter exatamente dois jogadores.');
     }
-
-    const playerTeams = room.players.map((player) => {
-      if (player.team.length !== GAME_RULES.teamSize) {
-        throw new BattleRuleError(`Cada jogador precisa ter ${GAME_RULES.teamSize} personagens.`);
-      }
-      const ids = player.team.map(({ characterId }) => characterId);
-      if (new Set(ids).size !== ids.length) {
-        throw new BattleRuleError('Um time não pode conter personagens repetidos.');
-      }
-
-      const characters: BattleCharacter[] = [];
-      for (const characterId of ids) {
-        const character = charactersById.get(characterId);
-        if (!character) {
-          throw new BattleRuleError('O time contém um personagem fora do roster.');
-        }
-        characters.push(character);
-      }
-      return characters;
-    });
-
-    const scenarioRules = GAME_RULES.scenarios[scenario];
-    const teamA = calculateTeamScore(
-      room.players[0].playerId,
-      playerTeams[0],
-      playerTeams[1],
-      scenario
-    );
-    const teamB = calculateTeamScore(
-      room.players[1].playerId,
-      playerTeams[1],
-      playerTeams[0],
-      scenario
-    );
-    const probabilityA = probabilityFromDifference(
-      teamA.total - teamB.total,
-      scenarioRules.probabilityScale
-    );
-    const randomValue = this.random();
-    if (!Number.isFinite(randomValue) || randomValue < 0 || randomValue >= 1) {
-      throw new Error('Battle random source must return a number in the range [0, 1).');
+    if (!Number.isSafeInteger(seed) || seed < 0 || seed > MAX_SEED) {
+      throw new BattleRuleError('A seed da batalha deve ser um inteiro de 32 bits sem sinal.');
     }
 
-    const scores: BattleScoreBreakdown[] = [
-      { ...teamA, winProbability: probabilityA },
-      { ...teamB, winProbability: 1 - probabilityA }
-    ];
+    const teams = room.players.map((player) => player.team.map(({ characterId }) => {
+      const character = charactersById.get(characterId);
+      if (!character) {
+        throw new BattleRuleError('O time contém um personagem fora do roster.');
+      }
+      return character;
+    })) as [BattleCharacter[], BattleCharacter[]];
+    const playerIds = [room.players[0].playerId, room.players[1].playerId] as const;
+    const scenarioAnalyses = BATTLE_SCENARIOS.map(
+      (battleScenario) => analyzeScenario(playerIds, teams, battleScenario)
+    );
+    const overallProbabilities = playerIds.map((playerId, playerIndex) => ({
+      playerId,
+      probability: scenarioAnalyses.reduce(
+        (sum, analysis) => sum + analysis.scores[playerIndex].winProbability,
+        0
+      ) / scenarioAnalyses.length
+    }));
+    const selectedAnalysis = scenarioAnalyses.find((analysis) => analysis.scenario === scenario);
+    if (!selectedAnalysis) {
+      throw new Error(`Missing probability analysis for ${scenario}.`);
+    }
+
+    const randomValue = createSeededRandom(seed)();
     const result: BattleResult = {
       scenario,
-      winnerPlayerId: randomValue < probabilityA
-        ? room.players[0].playerId
-        : room.players[1].playerId,
+      winnerPlayerId: randomValue < selectedAnalysis.scores[0].winProbability
+        ? playerIds[0]
+        : playerIds[1],
+      seed,
       calculatedAt: now,
-      scores
+      scenarioAnalyses,
+      overallProbabilities
     };
 
     room.phase = 'RESULT';
+    room.forfeitWinnerPlayerId = null;
+    room.forfeitMessage = null;
+    room.forfeitAt = null;
+    room.battleSeed = seed;
     room.battleResult = result;
     return result;
   }

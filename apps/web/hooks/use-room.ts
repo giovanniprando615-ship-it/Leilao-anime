@@ -13,7 +13,9 @@ import type {
   RoomActionPayload,
   RoomCode,
   RoomState,
-  ServerToClientEvents
+  ServerToClientEvents,
+  SetReadyPayload,
+  SetRoomSeriesPayload
 } from '@leilao/shared';
 
 const ROOM_CODE_KEY = 'leilao.roomCode';
@@ -26,6 +28,8 @@ type RoomActionName =
   | 'auction:bid'
   | 'auction:pass'
   | 'auction:restart'
+  | 'room:set-series'
+  | 'lobby:set-ready'
   | 'battle:start';
 
 function emitWithAck<T>(
@@ -62,6 +66,23 @@ export function useRoom() {
   const [serverOffsetMs, setServerOffsetMs] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [restoring, setRestoring] = useState(false);
+  const [recoveryIssue, setRecoveryIssue] = useState(false);
+  const [shouldReturnHome, setShouldReturnHome] = useState(false);
+  const retryRestoreRef = useRef<(() => void) | null>(null);
+  const noticeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const showNotice = useCallback((message: string) => {
+    setNotice(message);
+    if (noticeTimeoutRef.current) {
+      clearTimeout(noticeTimeoutRef.current);
+    }
+    noticeTimeoutRef.current = setTimeout(() => {
+      noticeTimeoutRef.current = null;
+      setNotice(null);
+    }, 4_000);
+  }, []);
 
   useEffect(() => {
     const socket = io(
@@ -69,18 +90,40 @@ export function useRoom() {
       { autoConnect: false }
     ) as RoomSocket;
     socketRef.current = socket;
+    let restoreTimeout: ReturnType<typeof setTimeout> | null = null;
 
-    socket.on('connect', () => {
-      setConnected(true);
-      setError(null);
+    function clearRestoreTimeout(): void {
+      if (restoreTimeout) {
+        clearTimeout(restoreTimeout);
+        restoreTimeout = null;
+      }
+    }
 
+    function startRestoreTimeout(): void {
+      if (restoreTimeout) {
+        return;
+      }
+      setRestoring(true);
+      restoreTimeout = setTimeout(() => {
+        restoreTimeout = null;
+        setRestoring(false);
+        setRecoveryIssue(true);
+        setError('A reconexão está demorando. Você pode tentar novamente ou voltar ao início.');
+      }, 10_000);
+    }
+
+    function restoreSavedSession(): void {
       const savedRoomCode = localStorage.getItem(ROOM_CODE_KEY);
       const savedPlayerId = localStorage.getItem(PLAYER_ID_KEY);
       const savedPlayerName = localStorage.getItem(PLAYER_NAME_KEY) ?? 'Jogador';
       if (!savedRoomCode || !savedPlayerId) {
+        setRestoring(false);
+        setRecoveryIssue(false);
+        clearRestoreTimeout();
         return;
       }
 
+      startRestoreTimeout();
       void emitWithAck<JoinRoomResult>((ack) => {
         socket.emit('room:join', {
           roomCode: savedRoomCode,
@@ -88,30 +131,96 @@ export function useRoom() {
           playerName: savedPlayerName
         }, ack);
       }).then((response) => {
+        clearRestoreTimeout();
+        setRestoring(false);
         if (!response.ok) {
           clearSession();
           roomRef.current = null;
           playerIdRef.current = null;
           setRoom(null);
           setPlayerId(null);
-          setError(response.error);
+          setRecoveryIssue(false);
+          setShouldReturnHome(true);
+          setError(response.error.includes('Sala não encontrada')
+            ? 'Essa sala não existe mais. A sessão antiga foi removida.'
+            : 'Não foi possível reassumir essa sala. A sessão antiga foi removida.');
           return;
         }
+        setRecoveryIssue(false);
+        setShouldReturnHome(false);
         playerIdRef.current = response.data?.playerId ?? savedPlayerId;
         setPlayerId(playerIdRef.current);
       }).catch((cause: unknown) => {
+        clearRestoreTimeout();
+        setRestoring(false);
+        setRecoveryIssue(true);
         setError(cause instanceof Error ? cause.message : 'Não foi possível reassumir a sala.');
       });
+    }
+
+    retryRestoreRef.current = () => {
+      setError(null);
+      setRecoveryIssue(false);
+      setShouldReturnHome(false);
+      if (socket.connected) {
+        restoreSavedSession();
+      } else {
+        startRestoreTimeout();
+        socket.connect();
+      }
+    };
+
+    socket.on('connect', () => {
+      setConnected(true);
+      setError(null);
+
+      restoreSavedSession();
     });
 
-    socket.on('disconnect', () => setConnected(false));
+    socket.on('disconnect', () => {
+      setConnected(false);
+      if (localStorage.getItem(ROOM_CODE_KEY) && localStorage.getItem(PLAYER_ID_KEY)) {
+        startRestoreTimeout();
+      }
+    });
     socket.on('connect_error', () => {
       setConnected(false);
       setError('Não foi possível conectar ao servidor de jogo.');
     });
     socket.on('room:state', (nextRoom) => {
+      const previousRoom = roomRef.current;
+      const currentPlayerId = playerIdRef.current;
+      if (previousRoom && nextRoom.phase === 'AUCTION' && nextRoom.auction) {
+        const previousSaleAt = previousRoom.auction?.lastSale?.resolvedAt;
+        const latestSale = nextRoom.auction.lastSale;
+        if (latestSale && latestSale.resolvedAt !== previousSaleAt) {
+          const characterName = latestSale.characterId.replaceAll('-', ' ');
+          showNotice(latestSale.playerId === currentPlayerId
+            ? `Você levou ${characterName}!`
+            : `${characterName} foi para o adversário.`);
+        } else if (
+          previousRoom.auction?.currentCharacterId === nextRoom.auction.currentCharacterId
+          && previousRoom.auction.leadingPlayerId !== nextRoom.auction.leadingPlayerId
+          && nextRoom.auction.leadingPlayerId
+        ) {
+          showNotice(nextRoom.auction.leadingPlayerId === currentPlayerId
+            ? 'Você assumiu a liderança do lote.'
+            : 'Seu lance foi superado.');
+        }
+      }
+      const reconnectedPlayer = nextRoom.players.find((player) => (
+        player.connected
+        && previousRoom?.players.some((previous) => previous.playerId === player.playerId && !previous.connected)
+      ));
+      if (reconnectedPlayer) {
+        showNotice(`${reconnectedPlayer.name} reconectou.`);
+      }
       roomRef.current = nextRoom;
       setRoom(nextRoom);
+      setRestoring(false);
+      setRecoveryIssue(false);
+      setShouldReturnHome(false);
+      clearRestoreTimeout();
       setServerOffsetMs(nextRoom.serverTime - Date.now());
       setError(null);
     });
@@ -121,16 +230,27 @@ export function useRoom() {
       playerIdRef.current = null;
       setRoom(null);
       setPlayerId(null);
+      setRecoveryIssue(false);
       setError('Esta sala foi encerrada por inatividade.');
+      setShouldReturnHome(true);
     });
 
     socket.connect();
+    if (localStorage.getItem(ROOM_CODE_KEY) && localStorage.getItem(PLAYER_ID_KEY)) {
+      startRestoreTimeout();
+    }
     return () => {
       socket.removeAllListeners();
       socket.disconnect();
+      clearRestoreTimeout();
+      if (noticeTimeoutRef.current) {
+        clearTimeout(noticeTimeoutRef.current);
+      }
+      noticeTimeoutRef.current = null;
+      retryRestoreRef.current = null;
       socketRef.current = null;
     };
-  }, []);
+  }, [showNotice]);
 
   const createRoom = useCallback(async (playerName: string, series: AnimeSeries) => {
     const socket = socketRef.current;
@@ -197,7 +317,7 @@ export function useRoom() {
 
   const sendAction = useCallback(async (
     action: RoomActionName,
-    options: { amountCents?: number; scenario?: BattleScenario } = {}
+    options: { amountCents?: number; scenario?: BattleScenario; series?: AnimeSeries; ready?: boolean } = {}
   ) => {
     const socket = socketRef.current;
     const currentRoom = roomRef.current;
@@ -227,6 +347,22 @@ export function useRoom() {
           }, ack);
           return;
         }
+        if (action === 'room:set-series') {
+          const payload: SetRoomSeriesPayload = {
+            ...roomAction,
+            series: options.series ?? 'ONE_PIECE'
+          };
+          socket.emit(action, payload, ack);
+          return;
+        }
+        if (action === 'lobby:set-ready') {
+          const payload: SetReadyPayload = {
+            ...roomAction,
+            ready: options.ready ?? false
+          };
+          socket.emit(action, payload, ack);
+          return;
+        }
         socket.emit(action, roomAction, ack);
       });
       if (!response.ok) {
@@ -239,6 +375,78 @@ export function useRoom() {
     }
   }, []);
 
+  const leaveRoom = useCallback(async (): Promise<boolean> => {
+    const socket = socketRef.current;
+    const currentRoom = roomRef.current;
+    const currentPlayerId = playerIdRef.current;
+    if (!socket?.connected || !currentRoom || !currentPlayerId) {
+      setError('A conexão com a sala foi perdida. A sessão local foi encerrada.');
+      clearSession();
+      roomRef.current = null;
+      playerIdRef.current = null;
+      setRoom(null);
+      setPlayerId(null);
+      return true;
+    }
+
+    setBusy(true);
+    setError(null);
+    try {
+      const response = await emitWithAck<void>((ack) => {
+        socket.emit('room:leave', {
+          roomCode: currentRoom.roomCode,
+          playerId: currentPlayerId
+        }, ack);
+      });
+      if (!response.ok) {
+        if (response.error.includes('Sala não encontrada') || response.error.includes('não pertence')) {
+          clearSession();
+          roomRef.current = null;
+          playerIdRef.current = null;
+          setRoom(null);
+          setPlayerId(null);
+          setRecoveryIssue(false);
+          return true;
+        }
+        setError(response.error);
+        return false;
+      }
+      clearSession();
+      roomRef.current = null;
+      playerIdRef.current = null;
+      setRoom(null);
+      setPlayerId(null);
+      setRecoveryIssue(false);
+      return true;
+    } catch (cause) {
+      socket.disconnect();
+      clearSession();
+      roomRef.current = null;
+      playerIdRef.current = null;
+      setRoom(null);
+      setPlayerId(null);
+      setRecoveryIssue(false);
+      setError(cause instanceof Error ? cause.message : 'A sessão local foi encerrada sem confirmação do servidor.');
+      socket.connect();
+      return true;
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  const returnToHome = useCallback(() => {
+    clearSession();
+    roomRef.current = null;
+    playerIdRef.current = null;
+    setRoom(null);
+    setPlayerId(null);
+    setRecoveryIssue(false);
+    setShouldReturnHome(false);
+    setError(null);
+  }, []);
+
+  const retryRestore = useCallback(() => retryRestoreRef.current?.(), []);
+
   return {
     room,
     playerId,
@@ -246,8 +454,22 @@ export function useRoom() {
     serverOffsetMs,
     busy,
     error,
+    notice,
+    dismissNotice: () => {
+      if (noticeTimeoutRef.current) {
+        clearTimeout(noticeTimeoutRef.current);
+        noticeTimeoutRef.current = null;
+      }
+      setNotice(null);
+    },
+    restoring,
+    recoveryIssue,
+    shouldReturnHome,
     createRoom,
     joinRoom,
+    leaveRoom,
+    returnToHome,
+    retryRestore,
     sendAction,
     dismissError: () => setError(null)
   };

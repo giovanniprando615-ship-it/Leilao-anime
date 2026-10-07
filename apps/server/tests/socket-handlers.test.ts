@@ -67,11 +67,12 @@ test('creates rooms, joins and restores players, then enforces auction actions o
     playerName: 'Host',
     series: 'UNKNOWN'
   });
+
   assert.equal(invalidSeriesResponse.ok, false);
   const hostStatePromise = nextRoomState(host);
   const createResponse = await emitWithAck<CreateRoomResult>(host, 'room:create', {
     playerName: 'Host',
-    series: 'NARUTO'
+    series: 'ONE_PIECE'
   });
   assert.equal(createResponse.ok, true);
   if (!createResponse.ok || !createResponse.data) {
@@ -82,10 +83,11 @@ test('creates rooms, joins and restores players, then enforces auction actions o
   assert.match(roomCode, /^[A-HJ-NP-Z2-9]{5}$/);
   const hostState = await hostStatePromise;
   assert.equal(hostState.phase, 'LOBBY');
-  assert.equal(hostState.series, 'NARUTO');
+  assert.equal(hostState.series, 'ONE_PIECE');
   assert.equal(hostState.players.length, 1);
   assert.equal(hostState.hostPlayerId, hostPlayerId);
   assert.equal(typeof hostState.serverTime, 'number');
+  assert.equal(hostState.battleSeed, null);
 
   const guest = await connectClient();
   const joinedStatePromise = nextRoomState(host);
@@ -101,6 +103,22 @@ test('creates rooms, joins and restores players, then enforces auction actions o
   const joinedState = await joinedStatePromise;
   assert.equal(joinedState.players.length, 2);
   assert.equal(joinedState.players.find((player) => player.playerId === guestPlayerId)?.connected, true);
+
+  const guestSeriesChange = await emitWithAck(guest, 'room:set-series', {
+    roomCode,
+    playerId: guestPlayerId,
+    series: 'BLACK_CLOVER'
+  });
+  assert.equal(guestSeriesChange.ok, false);
+
+  const changedSeriesStatePromise = nextRoomState(host);
+  const hostSeriesChange = await emitWithAck(host, 'room:set-series', {
+    roomCode,
+    playerId: hostPlayerId,
+    series: 'NARUTO'
+  });
+  assert.deepEqual(hostSeriesChange, { ok: true });
+  assert.equal((await changedSeriesStatePromise).series, 'NARUTO');
 
   const disconnectedStatePromise = nextRoomState(host);
   guest.disconnect();
@@ -132,6 +150,23 @@ test('creates rooms, joins and restores players, then enforces auction actions o
   });
   assert.equal(guestStartResponse.ok, false);
 
+  const notReadyResponse = await emitWithAck(host, 'auction:start', {
+    roomCode,
+    playerId: hostPlayerId
+  });
+  assert.equal(notReadyResponse.ok, false);
+
+  assert.deepEqual(await emitWithAck(reconnectedGuest, 'lobby:set-ready', {
+    roomCode,
+    playerId: guestPlayerId,
+    ready: true
+  }), { ok: true });
+  assert.deepEqual(await emitWithAck(host, 'lobby:set-ready', {
+    roomCode,
+    playerId: hostPlayerId,
+    ready: true
+  }), { ok: true });
+
   const startedStatePromise = nextRoomState(host);
   const startResponse = await emitWithAck(host, 'auction:start', {
     roomCode,
@@ -140,10 +175,18 @@ test('creates rooms, joins and restores players, then enforces auction actions o
   assert.deepEqual(startResponse, { ok: true });
   const startedState = await startedStatePromise;
   assert.equal(startedState.phase, 'AUCTION');
+  assert.equal(startedState.series, 'NARUTO');
   assert.ok(ROSTER.filter((character) => character.series === startedState.series)
     .some((character) => character.id === startedState.auction?.currentCharacterId));
   assert.ok(startedState.auction?.currentCharacterId);
   assert.equal(startedState.auction?.currentBidCents, 0);
+
+  const lockedSeriesChange = await emitWithAck(host, 'room:set-series', {
+    roomCode,
+    playerId: hostPlayerId,
+    series: 'BLACK_CLOVER'
+  });
+  assert.equal(lockedSeriesChange.ok, false);
 
   const firstBidStatePromise = nextRoomState(host);
   const firstBidResponse = await emitWithAck(reconnectedGuest, 'auction:bid', {
@@ -239,8 +282,12 @@ test('creates rooms, joins and restores players, then enforces auction actions o
   const battleState = await battleStatePromise;
   assert.equal(battleState.phase, 'RESULT');
   assert.equal(battleState.battleResult?.scenario, 'STANDARD');
-  assert.equal(battleState.battleResult?.scores.length, 2);
+  assert.equal(
+    battleState.battleResult?.scenarioAnalyses.find(({ scenario }) => scenario === 'STANDARD')?.scores.length,
+    2
+  );
   assert.ok(battleState.battleResult?.winnerPlayerId);
+  assert.equal(battleState.battleSeed, battleState.battleResult?.seed);
 
   const invalidScenarioResponse = await emitWithAck(host, 'battle:start', {
     roomCode,
@@ -258,7 +305,10 @@ test('creates rooms, joins and restores players, then enforces auction actions o
   assert.deepEqual(rematchResponse, { ok: true });
   const rematchState = await rematchStatePromise;
   assert.equal(rematchState.battleResult?.scenario, 'DEATHMATCH');
-  assert.ok(rematchState.battleResult?.scores.every((score) => (
+  const deathmatchScores = rematchState.battleResult?.scenarioAnalyses.find(
+    ({ scenario }) => scenario === 'DEATHMATCH'
+  )?.scores;
+  assert.ok(deathmatchScores?.every((score) => (
     Array.isArray(score.synergyBreakdown)
     && Array.isArray(score.counterBreakdown)
     && Array.isArray(score.scenarioBreakdown)
@@ -275,7 +325,99 @@ test('creates rooms, joins and restores players, then enforces auction actions o
   assert.equal(lobbyState.series, 'NARUTO');
   assert.equal(lobbyState.auction, null);
   assert.equal(lobbyState.battleResult, null);
+  assert.equal(lobbyState.battleSeed, null);
   assert.ok(lobbyState.players.every((player) => (
     player.team.length === 0 && player.balanceCents === 6000
   )));
+});
+
+test('leaving a live room awards a forfeit, clears socket membership, and allows the quitter to create another room', async () => {
+  const host = await connectClient();
+  const createResponse = await emitWithAck<CreateRoomResult>(host, 'room:create', {
+    playerName: 'Host',
+    series: 'ONE_PIECE'
+  });
+  assert.ok(createResponse.ok && createResponse.data);
+  const { roomCode, playerId: hostPlayerId } = createResponse.data;
+
+  const guest = await connectClient();
+  const joinResponse = await emitWithAck<JoinRoomResult>(guest, 'room:join', {
+    roomCode,
+    playerName: 'Guest'
+  });
+  assert.ok(joinResponse.ok && joinResponse.data);
+  const guestPlayerId = joinResponse.data.playerId;
+
+  assert.deepEqual(await emitWithAck(host, 'lobby:set-ready', {
+    roomCode,
+    playerId: hostPlayerId,
+    ready: true
+  }), { ok: true });
+  assert.deepEqual(await emitWithAck(guest, 'lobby:set-ready', {
+    roomCode,
+    playerId: guestPlayerId,
+    ready: true
+  }), { ok: true });
+
+  const hostRoomState = nextRoomState(host);
+  const startResponse = await emitWithAck(host, 'auction:start', { roomCode, playerId: hostPlayerId });
+  assert.deepEqual(startResponse, { ok: true });
+  await hostRoomState;
+
+  const forfeitStatePromise = nextRoomState(host);
+  const leaveResponse = await emitWithAck(guest, 'room:leave', { roomCode, playerId: guestPlayerId });
+  assert.deepEqual(leaveResponse, { ok: true });
+  const forfeitState = await forfeitStatePromise;
+  assert.equal(forfeitState.phase, 'RESULT');
+  assert.equal(forfeitState.forfeitWinnerPlayerId, hostPlayerId);
+  assert.match(forfeitState.forfeitMessage ?? '', /Guest saiu da partida/);
+  assert.deepEqual(forfeitState.players.map(({ playerId }) => playerId), [hostPlayerId]);
+
+  const nextCreateState = nextRoomState(guest);
+  const secondCreate = await emitWithAck<CreateRoomResult>(guest, 'room:create', {
+    playerName: 'Guest',
+    series: 'NARUTO'
+  });
+  assert.ok(secondCreate.ok && secondCreate.data);
+  assert.notEqual(secondCreate.data.roomCode, roomCode);
+  assert.equal((await nextCreateState).series, 'NARUTO');
+
+  assert.deepEqual(await emitWithAck(host, 'room:leave', {
+    roomCode,
+    playerId: hostPlayerId
+  }), { ok: true });
+  assert.equal(await gameServer.roomStore.get(roomCode), null);
+});
+
+test('leaving the lobby transfers host authority to the remaining player', async () => {
+  const host = await connectClient();
+  const createResponse = await emitWithAck<CreateRoomResult>(host, 'room:create', {
+    playerName: 'Host',
+    series: 'BLACK_CLOVER'
+  });
+  assert.ok(createResponse.ok && createResponse.data);
+  const { roomCode, playerId: hostPlayerId } = createResponse.data;
+
+  const guest = await connectClient();
+  const joinResponse = await emitWithAck<JoinRoomResult>(guest, 'room:join', {
+    roomCode,
+    playerName: 'Guest'
+  });
+  assert.ok(joinResponse.ok && joinResponse.data);
+  const guestPlayerId = joinResponse.data.playerId;
+
+  const lobbyStatePromise = nextRoomState(guest);
+  const leaveResponse = await emitWithAck(host, 'room:leave', { roomCode, playerId: hostPlayerId });
+  assert.deepEqual(leaveResponse, { ok: true });
+  const lobbyState = await lobbyStatePromise;
+  assert.equal(lobbyState.phase, 'LOBBY');
+  assert.equal(lobbyState.hostPlayerId, guestPlayerId);
+  assert.deepEqual(lobbyState.players.map(({ playerId }) => playerId), [guestPlayerId]);
+
+  const secondRoomResponse = await emitWithAck<CreateRoomResult>(host, 'room:create', {
+    playerName: 'Host',
+    series: 'NARUTO'
+  });
+  assert.ok(secondRoomResponse.ok && secondRoomResponse.data);
+  assert.notEqual(secondRoomResponse.data.roomCode, roomCode);
 });

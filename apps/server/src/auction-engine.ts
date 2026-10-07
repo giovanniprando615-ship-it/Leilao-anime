@@ -36,6 +36,10 @@ export class AuctionEngine {
 
     room.phase = 'AUCTION';
     room.battleResult = null;
+    room.battleSeed = null;
+    room.forfeitWinnerPlayerId = null;
+    room.forfeitMessage = null;
+    room.forfeitAt = null;
     room.auction = {
       round: 1,
       currentCharacterId: null,

@@ -78,6 +78,7 @@ function createPlayer(playerId: PlayerId, name: string): RoomPlayer {
     playerId,
     name,
     connected: true,
+    ready: false,
     balanceCents: GAME_RULES.startingBalanceCents,
     team: []
   };
@@ -89,9 +90,13 @@ function toSnapshot(room: StoredRoom): RoomState {
     series: room.series,
     phase: room.phase,
     hostPlayerId: room.hostPlayerId,
+    forfeitWinnerPlayerId: room.forfeitWinnerPlayerId,
+    forfeitMessage: room.forfeitMessage,
+    forfeitAt: room.forfeitAt,
     players: room.players,
     auction: room.auction,
     battleResult: room.battleResult,
+    battleSeed: room.battleSeed,
     serverTime: Date.now()
   };
 }
@@ -276,9 +281,13 @@ export function registerSocketHandlers(io: GameServer, store: RoomStore): () => 
           series,
           phase: 'LOBBY',
           hostPlayerId: playerId,
+          forfeitWinnerPlayerId: null,
+          forfeitMessage: null,
+          forfeitAt: null,
           players: [createPlayer(playerId, name)],
           auction: null,
           battleResult: null,
+          battleSeed: null,
           lastActivityAt: now
         };
 
@@ -339,6 +348,103 @@ export function registerSocketHandlers(io: GameServer, store: RoomStore): () => 
       });
     });
 
+    socket.on('room:leave', (payload, ack) => {
+      runAck<void>(ack, socket, 'room:leave', async () => {
+        const roomCode = requireRoomCode(payload?.roomCode);
+        const playerId = payload?.playerId;
+        if (typeof playerId !== 'string' || playerId.length === 0) {
+          throw new RoomServiceError('Identificador de jogador inválido.');
+        }
+
+        await roomLocks.run(roomCode, async () => {
+          const room = await getActionRoom(socket, roomCode, playerId);
+          const departingPlayer = room.players.find((player) => player.playerId === playerId);
+          if (!departingPlayer) {
+            throw new RoomServiceError('Jogador não pertence a esta sala.');
+          }
+
+          clearAuctionTimer(roomCode);
+          room.players = room.players.filter((player) => player.playerId !== playerId);
+          playerSocketIds.delete(playerId);
+          socket.data.playerId = undefined;
+          socket.data.roomCode = undefined;
+
+          if (room.players.length === 0) {
+            await store.delete(roomCode);
+          } else {
+            const remainingPlayer = room.players[0];
+            if (room.phase === 'LOBBY') {
+              room.hostPlayerId = remainingPlayer.playerId;
+            } else {
+              room.hostPlayerId = remainingPlayer.playerId;
+              room.phase = 'RESULT';
+              room.forfeitWinnerPlayerId = remainingPlayer.playerId;
+              room.forfeitMessage = `${departingPlayer.name} saiu da partida. ${remainingPlayer.name} venceu por W.O.`;
+              room.forfeitAt = Date.now();
+              room.auction = null;
+              room.battleResult = null;
+              room.battleSeed = null;
+            }
+            await saveAndBroadcast(room);
+          }
+
+          await socket.leave(roomCode);
+        });
+      });
+    });
+
+    socket.on('room:set-series', (payload, ack) => {
+      runAck<void>(ack, socket, 'room:set-series', async () => {
+        const roomCode = requireRoomCode(payload?.roomCode);
+        const playerId = payload?.playerId;
+        if (typeof playerId !== 'string' || playerId.length === 0) {
+          throw new RoomServiceError('Identificador de jogador inválido.');
+        }
+        const series = requireAnimeSeries(payload?.series);
+
+        await roomLocks.run(roomCode, async () => {
+          const room = await getActionRoom(socket, roomCode, playerId);
+          if (room.hostPlayerId !== playerId) {
+            throw new RoomServiceError('Somente quem criou a sala pode escolher o anime.');
+          }
+          if (room.phase !== 'LOBBY') {
+            throw new RoomServiceError('O anime fica definido após o início do leilão.');
+          }
+          room.series = series;
+          for (const player of room.players) {
+            player.ready = false;
+          }
+          await saveAndBroadcast(room);
+        });
+      });
+    });
+
+    socket.on('lobby:set-ready', (payload, ack) => {
+      runAck<void>(ack, socket, 'lobby:set-ready', async () => {
+        const roomCode = requireRoomCode(payload?.roomCode);
+        const playerId = payload?.playerId;
+        if (typeof playerId !== 'string' || playerId.length === 0) {
+          throw new RoomServiceError('Identificador de jogador inválido.');
+        }
+        if (typeof payload?.ready !== 'boolean') {
+          throw new RoomServiceError('Informe se o jogador está pronto.');
+        }
+
+        await roomLocks.run(roomCode, async () => {
+          const room = await getActionRoom(socket, roomCode, playerId);
+          if (room.phase !== 'LOBBY') {
+            throw new RoomServiceError('A confirmação só pode ser alterada no lobby.');
+          }
+          const player = room.players.find((candidate) => candidate.playerId === playerId);
+          if (!player) {
+            throw new RoomServiceError('Jogador não pertence a esta sala.');
+          }
+          player.ready = payload.ready;
+          await saveAndBroadcast(room);
+        });
+      });
+    });
+
     socket.on('auction:start', (payload, ack) => {
       runAck<void>(ack, socket, 'auction:start', async () => {
         const roomCode = requireRoomCode(payload?.roomCode);
@@ -351,6 +457,9 @@ export function registerSocketHandlers(io: GameServer, store: RoomStore): () => 
           const room = await getActionRoom(socket, roomCode, playerId);
           if (room.hostPlayerId !== playerId) {
             throw new AuctionRuleError('Somente quem criou a sala pode iniciar o leilão.');
+          }
+          if (room.players.length !== 2 || room.players.some((player) => !player.ready)) {
+            throw new AuctionRuleError('Os dois jogadores precisam confirmar que estão prontos.');
           }
           auctionEngine.start(room);
           await saveAndBroadcast(room);
@@ -415,6 +524,10 @@ export function registerSocketHandlers(io: GameServer, store: RoomStore): () => 
           room.phase = 'LOBBY';
           room.auction = null;
           room.battleResult = null;
+          room.battleSeed = null;
+          room.forfeitWinnerPlayerId = null;
+          room.forfeitMessage = null;
+          room.forfeitAt = null;
           for (const player of room.players) {
             player.balanceCents = GAME_RULES.startingBalanceCents;
             player.team = [];
@@ -437,7 +550,8 @@ export function registerSocketHandlers(io: GameServer, store: RoomStore): () => 
           if (room.hostPlayerId !== playerId) {
             throw new BattleRuleError('Somente quem criou a sala pode iniciar a batalha.');
           }
-          battleEngine.simulate(room, payload.scenario);
+          const seed = randomInt(0x1_0000_0000);
+          battleEngine.simulate(room, payload.scenario, seed);
           await saveAndBroadcast(room);
         });
       });
@@ -462,6 +576,7 @@ export function registerSocketHandlers(io: GameServer, store: RoomStore): () => 
         }
 
         player.connected = false;
+        player.ready = false;
         await saveAndBroadcast(room);
       }).catch((error: unknown) => {
         console.error(`Failed to record disconnect for player ${playerId}:`, error);

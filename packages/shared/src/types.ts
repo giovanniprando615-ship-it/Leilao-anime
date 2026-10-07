@@ -13,6 +13,7 @@ export interface RoomPlayer {
   playerId: PlayerId;
   name: string;
   connected: boolean;
+  ready: boolean;
   balanceCents: number;
   team: OwnedCharacter[];
 }
@@ -53,13 +54,27 @@ export interface BattleScoreBreakdown {
 export interface BattleModifier {
   id: string;
   points: number;
+  probabilityChange: number;
+}
+
+export interface BattleScenarioAnalysis {
+  scenario: BattleScenario;
+  scores: BattleScoreBreakdown[];
+  drawProbability: number;
+}
+
+export interface BattleWinProbability {
+  playerId: PlayerId;
+  probability: number;
 }
 
 export interface BattleResult {
   scenario: BattleScenario;
   winnerPlayerId: PlayerId;
+  seed: number;
   calculatedAt: number;
-  scores: BattleScoreBreakdown[];
+  scenarioAnalyses: BattleScenarioAnalysis[];
+  overallProbabilities: BattleWinProbability[];
 }
 
 export interface RoomState {
@@ -67,9 +82,13 @@ export interface RoomState {
   series: AnimeSeries;
   phase: RoomPhase;
   hostPlayerId: PlayerId;
+  forfeitWinnerPlayerId: PlayerId | null;
+  forfeitMessage: string | null;
+  forfeitAt: number | null;
   players: RoomPlayer[];
   auction: AuctionState | null;
   battleResult: BattleResult | null;
+  battleSeed: number | null;
   serverTime: number;
 }
 
@@ -87,6 +106,14 @@ export interface JoinRoomPayload {
 export interface RoomActionPayload {
   roomCode: RoomCode;
   playerId: PlayerId;
+}
+
+export interface SetRoomSeriesPayload extends RoomActionPayload {
+  series: AnimeSeries;
+}
+
+export interface SetReadyPayload extends RoomActionPayload {
+  ready: boolean;
 }
 
 export interface BidPayload extends RoomActionPayload {
@@ -115,6 +142,9 @@ export type Ack<T = undefined> = (response: AckResponse<T>) => void;
 export interface ClientToServerEvents {
   'room:create': (payload: CreateRoomPayload, ack: Ack<CreateRoomResult>) => void;
   'room:join': (payload: JoinRoomPayload, ack: Ack<JoinRoomResult>) => void;
+  'room:leave': (payload: RoomActionPayload, ack: Ack<void>) => void;
+  'room:set-series': (payload: SetRoomSeriesPayload, ack: Ack<void>) => void;
+  'lobby:set-ready': (payload: SetReadyPayload, ack: Ack<void>) => void;
   'auction:start': (payload: RoomActionPayload, ack: Ack<void>) => void;
   'auction:bid': (payload: BidPayload, ack: Ack<void>) => void;
   'auction:pass': (payload: RoomActionPayload, ack: Ack<void>) => void;
