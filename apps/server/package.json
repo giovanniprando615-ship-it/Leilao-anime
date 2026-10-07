@@ -1,0 +1,24 @@
+{
+  "name": "@leilao/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "dev": "tsx watch src/main.ts",
+    "test": "tsc --noEmit -p tsconfig.test.json && tsx --test tests/socket-handlers.test.ts tests/auction-engine.test.ts tests/battle-engine.test.ts"
+  },
+  "dependencies": {
+    "@leilao/shared": "0.1.0",
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.1",
+    "@types/node": "^22.14.0",
+    "socket.io-client": "^4.8.1",
+    "tsx": "^4.19.3"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "leilao-tatico-anime",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build:shared": "npm run build --workspace @leilao/shared",
+    "build:server": "npm run build:shared && npm run build --workspace @leilao/server",
+    "build:web": "npm run build:shared && npm run build --workspace @leilao/web",
+    "build": "npm run build:server && npm run build --workspace @leilao/web",
+    "test": "npm test --workspace @leilao/server"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}
